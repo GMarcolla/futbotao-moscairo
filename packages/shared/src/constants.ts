@@ -28,10 +28,14 @@ export const PHYSICS = {
     radius: 15,
     invMass: 0.5,
     bCoef: 0.5,
-    damping: 0.96,
-    acceleration: 0.1,
+    /**
+     * Mais ágil que o HaxBall original (0.96 / 0.1 / 0.07): chega na velocidade
+     * máxima em ~0,5s e para em ~0,7s.
+     */
+    damping: 0.92,
+    acceleration: 0.26,
     /** Segurando o chute o jogador fica mais lento, como no HaxBall. */
-    kickingAcceleration: 0.07,
+    kickingAcceleration: 0.18,
     kickStrength: 5,
     /** Distância extra (além do encosto) em que o chute ainda pega na bola. */
     kickRange: 4,
@@ -51,8 +55,8 @@ export const PHYSICS = {
   /** Coeficiente de quique do limite externo dos jogadores. */
   playerWallBCoef: 0.5,
   dash: {
-    /** Velocidade somada na direção do movimento (~3 corpos de distância). */
-    impulse: 3,
+    /** Velocidade somada na direção do movimento (~75px a mais, 2,5 corpos). */
+    impulse: 6,
     /** Por quantos ticks o dash fica "visível" (rastro). */
     visualTicks: 12,
   },
