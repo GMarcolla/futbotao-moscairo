@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Futbotão Moscairo</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="scoreboard" hidden>
+        <div class="team moscow"><span class="name">Moscow</span><span class="score" id="score-moscow">0</span></div>
+        <div class="clock"><span id="clock">00:00</span><small id="clock-sub"></small></div>
+        <div class="team cairo"><span class="score" id="score-cairo">0</span><span class="name">Cairo</span></div>
+      </header>
+      <main id="stage">
+        <canvas id="field"></canvas>
+        <div id="banner" hidden></div>
+        <div id="replay-tag" hidden></div>
+        <div id="hint" hidden></div>
+        <section id="panel" class="overlay" hidden></section>
+        <section id="join" class="overlay">
+          <form id="join-form" class="card">
+            <h1>Futbotão <span>Moscairo</span></h1>
+            <p class="muted">Futebol de botão para as reuniões de descompressão.</p>
+            <label for="nick">Seu apelido</label>
+            <input id="nick" maxlength="16" autocomplete="nickname" required placeholder="Ex.: Zico do Deploy" />
+            <button type="submit" class="primary">Entrar na sala</button>
+            <p class="muted small" id="join-status">Conectando ao servidor…</p>
+          </form>
+        </section>
+        <div id="toast" hidden></div>
+      </main>
+      <footer id="help">
+        <span><kbd>WASD</kbd>/<kbd>Setas</kbd> mover</span>
+        <span><kbd>Espaço</kbd>/<kbd>X</kbd> chutar</span>
+        <span><kbd>Shift</kbd>/<kbd>C</kbd> dash</span>
+        <span><kbd>1</kbd>–<kbd>4</kbd> chat rápido</span>
+        <span><kbd>Esc</kbd> painel da sala</span>
+        <span id="ping"></span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

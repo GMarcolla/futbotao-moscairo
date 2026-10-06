@@ -1,0 +1,20 @@
+{
+  "name": "futbotao-moscairo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c red,blue \"npm run dev -w @futbotao/server\" \"npm run dev -w @futbotao/client\"",
+    "build": "npm run build -w @futbotao/client",
+    "deploy:server": "npm run deploy -w @futbotao/server",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test -w @futbotao/shared"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  }
+}
