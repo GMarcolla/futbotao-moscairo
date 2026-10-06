@@ -37,6 +37,8 @@ export interface RenderInput {
   trail: Frame[];
   players: Map<number, PlayerInfo>;
   myNum: number | null;
+  /** Recarga total do dash em ticks (para desenhar a fração). */
+  dashCooldownTicks: number;
   bubbles: ChatBubble[];
   now: number;
 }
@@ -90,7 +92,8 @@ export class Renderer {
     for (const [num, pose] of frame.players) {
       const info = input.players.get(num);
       if (info && info.team !== "spectator") {
-        this.drawPlayer(pose.x, pose.y, pose.flags, pose.cooldown, info, num === input.myNum);
+        const cooldown = Math.min(1, pose.cooldown / input.dashCooldownTicks);
+        this.drawPlayer(pose.x, pose.y, pose.flags, cooldown, info, num === input.myNum);
       }
     }
     this.drawBall(frame.ball.x, frame.ball.y);

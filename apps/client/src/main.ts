@@ -5,6 +5,7 @@ import {
   type MatchResult,
   type PlayerInfo,
   type ServerMessage,
+  type Snapshot,
   TEAMS,
   TICK_RATE,
   type Team,
@@ -12,6 +13,7 @@ import {
 import { listenKeyboard } from "./input";
 import { connect } from "./net";
 import { Panel } from "./panel";
+import { Predictor } from "./predict";
 import { type ChatBubble, Renderer } from "./render";
 import { playCrowd, playWhistle, unlockAudio } from "./sound";
 import { type Frame, ReplayPlayer, Timeline } from "./timeline";
@@ -47,6 +49,7 @@ function storeName(name: string) {
 const room = readRoom();
 const renderer = new Renderer($<HTMLCanvasElement>("field"));
 const timeline = new Timeline();
+const predictor = new Predictor();
 
 let myId: string | null = null;
 let myName = "";
@@ -94,7 +97,7 @@ const panel = new Panel($("panel"), {
 
 const keyboard = listenKeyboard({
   enabled: () => isPlaying() && !panelOpen,
-  onChange: (bits) => net.send({ t: "input", i: bits }),
+  onChange: (bits) => net.send({ t: "input", i: bits, s: predictor.setInput(bits) }),
   onQuickChat: (n) => net.send({ t: "chat", n }),
   onTogglePanel: () => {
     if (lobby?.phase === "match") setPanelOpen(!panelOpen);
@@ -136,6 +139,7 @@ function handleMessage(msg: ServerMessage) {
       break;
     case "snap":
       timeline.push(msg.s, now);
+      onSnapForPrediction(msg.s);
       if (msg.s.ph === "replay") {
         if (!replay && lastGoal) {
           replay = new ReplayPlayer(lastGoal, timeline.extractReplay(lastGoal), now);
@@ -184,6 +188,7 @@ function onLobby(state: LobbyState) {
 
   if (state.phase === "match" && previous !== "match") {
     timeline.reset();
+    predictor.reset();
     replay = null;
     lastGoal = null;
     endedResult = null;
@@ -198,6 +203,38 @@ function onLobby(state: LobbyState) {
   $("score-cairo").textContent = String(state.score.cairo);
   panel.update(state, myId, room);
   updatePanelVisibility();
+}
+
+// ---- Predição do próprio jogador ----
+
+function myPlayer(): PlayerInfo | undefined {
+  return lobby?.players.find((p) => p.id === myId);
+}
+
+function dashCooldownTicks(): number {
+  return (lobby?.settings.dashCooldownSec ?? 10) * TICK_RATE;
+}
+
+function onSnapForPrediction(snap: Snapshot) {
+  const me = myPlayer();
+  const mine = me && me.team !== "spectator" ? snap.p.find((p) => p[0] === me.num) : undefined;
+  if (!me || me.team === "spectator" || !mine) {
+    predictor.reset();
+    return;
+  }
+  predictor.onServerState(mine, me.team, snap.ph, snap.ko, dashCooldownTicks());
+}
+
+/** Troca a pose do próprio jogador (atrasada) pela prevista (na hora). */
+function applyPrediction(frame: Frame, trail: Frame[], myNum: number) {
+  const pose = predictor.pose();
+  if (!pose || !frame.players.has(myNum)) return;
+  frame.players.set(myNum, pose);
+  trail.forEach((past, i) => {
+    const pos = predictor.poseAgo(TRAIL_TICKS[i]!);
+    const old = past.players.get(myNum);
+    if (pos && old) past.players.set(myNum, { ...old, ...pos });
+  });
 }
 
 // ---- Interface ----
@@ -313,6 +350,7 @@ function escapeText(s: string): string {
 
 function frameLoop() {
   const now = performance.now();
+  predictor.update(now);
   let frame: Frame | null = null;
   let trail: Frame[] = [];
   let slowMotion: boolean | null = null;
@@ -332,9 +370,12 @@ function frameLoop() {
     }
   }
 
-  const myNum = lobby?.players.find((p) => p.id === myId)?.num ?? null;
+  const myNum = myPlayer()?.num ?? null;
+  if (frame && slowMotion === null && myNum !== null) applyPrediction(frame, trail, myNum);
   renderer.draw(
-    frame ? { frame, trail, players: playersByNum, myNum, bubbles, now } : null,
+    frame
+      ? { frame, trail, players: playersByNum, myNum, dashCooldownTicks: dashCooldownTicks(), bubbles, now }
+      : null,
     frame && slowMotion === null ? frame.snap.ko : null,
   );
   updateHud(frame, slowMotion);

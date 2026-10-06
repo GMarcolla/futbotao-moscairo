@@ -57,8 +57,11 @@ export const PlayerFlag = {
   dashing: 2,
 } as const;
 
-/** [num, x, y, flags, recargaDoDash 0..1 (0 = pronto)] */
-export type PlayerSnap = [number, number, number, number, number];
+/**
+ * [num, x, y, flags, recargaDoDash (ticks restantes), vx, vy,
+ *  último comando processado (seq), ticks desde que esse comando passou a valer]
+ */
+export type PlayerSnap = [number, number, number, number, number, number, number, number, number];
 
 export interface Snapshot {
   /** Tick da simulação. */
@@ -91,7 +94,8 @@ export type ClientMessage =
   | { t: "team"; team: Team }
   | { t: "ready"; ready: boolean }
   | { t: "settings"; settings: RoomSettings }
-  | { t: "input"; i: number }
+  /** `s` numera os comandos para a predição no cliente. */
+  | { t: "input"; i: number; s: number }
   | { t: "chat"; n: number }
   | { t: "ping"; c: number };
 

@@ -8,6 +8,14 @@ import {
   integrate,
 } from "./physics";
 import {
+  type ControlledPlayer,
+  applyControls,
+  applyKickoffLimits,
+  collidePlayerWithStadium,
+  createPlayer,
+  pressInput,
+} from "./player";
+import {
   Input,
   type GoalInfo,
   type MatchPhase,
@@ -20,19 +28,14 @@ import {
   type Snapshot,
 } from "./types";
 
-export interface MatchPlayer extends Disc {
+export interface MatchPlayer extends ControlledPlayer {
   id: string;
   num: number;
   name: string;
-  team: PlayingTeam;
-  input: number;
-  /** Chute já usado neste aperto; só libera ao soltar o botão. */
-  kickConsumed: boolean;
-  /** Toque rápido no chute entre dois ticks não pode se perder. */
-  kickQueued: boolean;
-  dashQueued: boolean;
-  dashCooldown: number;
-  dashTicks: number;
+  /** Último comando recebido do cliente (para a predição dele). */
+  ackSeq: number;
+  /** Tick em que esse comando passou a valer. */
+  ackTick: number;
 }
 
 export type MatchEvent =
@@ -48,6 +51,7 @@ interface Touch {
 
 const other = (team: PlayingTeam): PlayingTeam => (team === "moscow" ? "cairo" : "moscow");
 const round1 = (n: number) => Math.round(n * 10) / 10;
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 export class Match {
   readonly settings: RoomSettings;
@@ -87,24 +91,12 @@ export class Match {
     const index = this.teamPlayers(team).length;
     const spawn = spawnPosition(team, index);
     this.players.set(id, {
+      ...createPlayer(team, spawn.x, spawn.y),
       id,
       num,
       name,
-      team,
-      x: spawn.x,
-      y: spawn.y,
-      vx: 0,
-      vy: 0,
-      radius: PHYSICS.player.radius,
-      invMass: PHYSICS.player.invMass,
-      bCoef: PHYSICS.player.bCoef,
-      damping: PHYSICS.player.damping,
-      input: 0,
-      kickConsumed: false,
-      kickQueued: false,
-      dashQueued: false,
-      dashCooldown: 0,
-      dashTicks: 0,
+      ackSeq: 0,
+      ackTick: this.tick + 1,
     });
   }
 
@@ -116,13 +108,15 @@ export class Match {
     return [...this.players.values()].filter((p) => p.team === team);
   }
 
-  setInput(id: string, input: number): void {
+  /** `seq` numera os comandos do cliente; vale a partir do próximo tick. */
+  setInput(id: string, input: number, seq = 0): void {
     const p = this.players.get(id);
     if (!p) return;
-    const pressed = input & ~p.input;
-    if (pressed & Input.kick) p.kickQueued = true;
-    if (pressed & Input.dash) p.dashQueued = true;
-    p.input = input;
+    pressInput(p, input);
+    if (seq > p.ackSeq) {
+      p.ackSeq = seq;
+      p.ackTick = this.tick + 1;
+    }
   }
 
   step(): MatchEvent[] {
@@ -155,7 +149,6 @@ export class Match {
   }
 
   snapshot(): Snapshot {
-    const cooldownTicks = this.settings.dashCooldownSec * TICK_RATE;
     const p: PlayerSnap[] = [];
     for (const pl of this.players.values()) {
       let flags = 0;
@@ -166,7 +159,11 @@ export class Match {
         round1(pl.x),
         round1(pl.y),
         flags,
-        Math.round((pl.dashCooldown / cooldownTicks) * 100) / 100,
+        pl.dashCooldown,
+        round2(pl.vx),
+        round2(pl.vy),
+        pl.ackSeq,
+        pl.ackSeq ? this.tick - pl.ackTick + 1 : 0,
       ]);
     }
     return {
@@ -198,37 +195,11 @@ export class Match {
   }
 
   private simulate(allowGoals: boolean, events: MatchEvent[]): void {
-    const cfg = PHYSICS.player;
     const cooldownTicks = this.settings.dashCooldownSec * TICK_RATE;
 
     for (const p of this.players.values()) {
+      applyControls(p, cooldownTicks);
       const holdingKick = (p.input & Input.kick) !== 0;
-      let dx = 0;
-      let dy = 0;
-      if (p.input & Input.left) dx -= 1;
-      if (p.input & Input.right) dx += 1;
-      if (p.input & Input.up) dy -= 1;
-      if (p.input & Input.down) dy += 1;
-      const len = Math.hypot(dx, dy);
-      if (len > 0) {
-        dx /= len;
-        dy /= len;
-        const acc = holdingKick ? cfg.kickingAcceleration : cfg.acceleration;
-        p.vx += dx * acc;
-        p.vy += dy * acc;
-      }
-
-      if (p.dashCooldown > 0) p.dashCooldown--;
-      if (p.dashTicks > 0) p.dashTicks--;
-      // Dash parado não faz nada e não gasta a recarga.
-      if (p.dashQueued && p.dashCooldown === 0 && len > 0) {
-        p.vx += dx * PHYSICS.dash.impulse;
-        p.vy += dy * PHYSICS.dash.impulse;
-        p.dashCooldown = cooldownTicks;
-        p.dashTicks = PHYSICS.dash.visualTicks;
-      }
-      p.dashQueued = false;
-
       if ((holdingKick || p.kickQueued) && !p.kickConsumed && this.ballInKickRange(p)) {
         this.kick(p);
         p.kickConsumed = true;
@@ -246,18 +217,15 @@ export class Match {
       for (let j = i + 1; j < players.length; j++) collideDiscs(a, players[j]!);
       if (collideDiscs(a, this.ball)) this.touch(a);
     }
-    for (const post of STADIUM_GEOMETRY.posts) {
-      collideDiscs(post, this.ball);
-      for (const p of players) collideDiscs(post, p);
-    }
+    for (const post of STADIUM_GEOMETRY.posts) collideDiscs(post, this.ball);
     for (const s of STADIUM_GEOMETRY.segments) {
       if (s.mask & Mask.ball) collideSegment(this.ball, s);
-      if (s.mask & Mask.player) for (const p of players) collideSegment(p, s);
     }
+    for (const p of players) collidePlayerWithStadium(p);
 
     if (this.kickoffTeam && this.phase === "playing") {
       if (this.ball.vx !== 0 || this.ball.vy !== 0) this.kickoffTeam = null;
-      else for (const p of players) this.applyKickoffLimits(p, this.kickoffTeam);
+      else for (const p of players) applyKickoffLimits(p, this.kickoffTeam);
     }
 
     if (allowGoals) this.checkGoal(events);
@@ -282,31 +250,6 @@ export class Match {
     if (this.touches[0]?.id === p.id) return;
     this.touches.unshift({ id: p.id, team: p.team });
     this.touches.length = Math.min(this.touches.length, 2);
-  }
-
-  /**
-   * Na saída de bola cada um fica no seu campo; quem não tem a saída
-   * também não pode entrar no círculo central.
-   */
-  private applyKickoffLimits(p: MatchPlayer, kickoffTeam: PlayingTeam): void {
-    const side = TEAMS[p.team].side;
-    const R = STADIUM.centerRadius;
-    const insideCircle = Math.hypot(p.x, p.y) < R;
-    if (side * p.x < p.radius && !(p.team === kickoffTeam && insideCircle)) {
-      p.x = side * p.radius;
-      p.vx = 0;
-    }
-    if (p.team !== kickoffTeam) {
-      const dist = Math.hypot(p.x, p.y);
-      const min = R + p.radius;
-      if (dist < min) {
-        const nx = dist > 0 ? p.x / dist : side;
-        const ny = dist > 0 ? p.y / dist : 0;
-        p.x = nx * min;
-        p.y = ny * min;
-        p.vx = p.vy = 0;
-      }
-    }
   }
 
   private checkGoal(events: MatchEvent[]): void {

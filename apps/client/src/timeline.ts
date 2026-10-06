@@ -4,7 +4,7 @@ export interface PlayerPose {
   x: number;
   y: number;
   flags: number;
-  /** Recarga do dash: 0 = pronto, 1 = acabou de usar. */
+  /** Ticks restantes de recarga do dash (0 = pronto). */
   cooldown: number;
 }
 

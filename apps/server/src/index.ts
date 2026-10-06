@@ -80,7 +80,10 @@ export class Room extends Server<Env> {
     if (!state) return;
     switch (msg.t) {
       case "input":
-        if (Number.isInteger(msg.i)) this.match?.setInput(conn.id, msg.i & 63);
+        if (Number.isInteger(msg.i)) {
+          const seq = Number.isInteger(msg.s) ? msg.s : 0;
+          this.match?.setInput(conn.id, msg.i & 63, seq);
+        }
         break;
       case "team":
         this.handleTeam(conn, state, msg.team);

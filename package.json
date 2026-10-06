@@ -11,7 +11,7 @@
     "build": "npm run build -w @futbotao/client",
     "deploy:server": "npm run deploy -w @futbotao/server",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test -w @futbotao/shared"
+    "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
