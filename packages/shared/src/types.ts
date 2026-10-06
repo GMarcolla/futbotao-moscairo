@@ -73,7 +73,8 @@ export interface Snapshot {
   ot: 0 | 1;
   /** Time que dá a saída de bola enquanto ela não foi tocada, senão null. */
   ko: PlayingTeam | null;
-  b: [number, number];
+  /** Bola: [x, y, vx, vy]. */
+  b: [number, number, number, number];
   p: PlayerSnap[];
 }
 

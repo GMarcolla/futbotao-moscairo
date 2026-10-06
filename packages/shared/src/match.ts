@@ -1,15 +1,11 @@
 import { PHYSICS, STADIUM, TEAMS, TICK_RATE, TIMING } from "./constants";
-import {
-  type Disc,
-  Mask,
-  STADIUM_GEOMETRY,
-  collideDiscs,
-  collideSegment,
-  integrate,
-} from "./physics";
+import { type Disc, collideDiscs, integrate } from "./physics";
 import {
   type ControlledPlayer,
   applyControls,
+  applyKick,
+  collideBallWithStadium,
+  createBall,
   applyKickoffLimits,
   collidePlayerWithStadium,
   createPlayer,
@@ -50,8 +46,9 @@ interface Touch {
 }
 
 const other = (team: PlayingTeam): PlayingTeam => (team === "moscow" ? "cairo" : "moscow");
-const round1 = (n: number) => Math.round(n * 10) / 10;
+// Precisão suficiente para a predição do cliente bater com o servidor.
 const round2 = (n: number) => Math.round(n * 100) / 100;
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
 
 export class Match {
   readonly settings: RoomSettings;
@@ -75,16 +72,7 @@ export class Match {
   constructor(settings: RoomSettings, kickoffTeam: PlayingTeam = "moscow") {
     this.settings = settings;
     this.kickoffTeam = kickoffTeam;
-    this.ball = {
-      x: 0,
-      y: 0,
-      vx: 0,
-      vy: 0,
-      radius: PHYSICS.ball.radius,
-      invMass: PHYSICS.ball.invMass,
-      bCoef: PHYSICS.ball.bCoef,
-      damping: PHYSICS.ball.damping,
-    };
+    this.ball = createBall();
   }
 
   addPlayer(id: string, num: number, name: string, team: PlayingTeam): void {
@@ -156,12 +144,12 @@ export class Match {
       if (pl.dashTicks > 0) flags |= PlayerFlag.dashing;
       p.push([
         pl.num,
-        round1(pl.x),
-        round1(pl.y),
+        round2(pl.x),
+        round2(pl.y),
         flags,
         pl.dashCooldown,
-        round2(pl.vx),
-        round2(pl.vy),
+        round3(pl.vx),
+        round3(pl.vy),
         pl.ackSeq,
         pl.ackSeq ? this.tick - pl.ackTick + 1 : 0,
       ]);
@@ -172,7 +160,7 @@ export class Match {
       t: this.elapsed,
       ot: this.overtime ? 1 : 0,
       ko: this.kickoffTeam,
-      b: [round1(this.ball.x), round1(this.ball.y)],
+      b: [round2(this.ball.x), round2(this.ball.y), round3(this.ball.vx), round3(this.ball.vy)],
       p,
     };
   }
@@ -199,13 +187,7 @@ export class Match {
 
     for (const p of this.players.values()) {
       applyControls(p, cooldownTicks);
-      const holdingKick = (p.input & Input.kick) !== 0;
-      if ((holdingKick || p.kickQueued) && !p.kickConsumed && this.ballInKickRange(p)) {
-        this.kick(p);
-        p.kickConsumed = true;
-      }
-      p.kickQueued = false;
-      if (!holdingKick) p.kickConsumed = false;
+      if (applyKick(p, this.ball)) this.touch(p);
     }
 
     integrate(this.ball);
@@ -217,10 +199,7 @@ export class Match {
       for (let j = i + 1; j < players.length; j++) collideDiscs(a, players[j]!);
       if (collideDiscs(a, this.ball)) this.touch(a);
     }
-    for (const post of STADIUM_GEOMETRY.posts) collideDiscs(post, this.ball);
-    for (const s of STADIUM_GEOMETRY.segments) {
-      if (s.mask & Mask.ball) collideSegment(this.ball, s);
-    }
+    collideBallWithStadium(this.ball);
     for (const p of players) collidePlayerWithStadium(p);
 
     if (this.kickoffTeam && this.phase === "playing") {
@@ -229,21 +208,6 @@ export class Match {
     }
 
     if (allowGoals) this.checkGoal(events);
-  }
-
-  private ballInKickRange(p: MatchPlayer): boolean {
-    const dist = Math.hypot(this.ball.x - p.x, this.ball.y - p.y);
-    return dist - p.radius - this.ball.radius < PHYSICS.player.kickRange;
-  }
-
-  private kick(p: MatchPlayer): void {
-    const dx = this.ball.x - p.x;
-    const dy = this.ball.y - p.y;
-    const dist = Math.hypot(dx, dy) || 1;
-    const strength = PHYSICS.player.kickStrength * this.ball.invMass;
-    this.ball.vx += (dx / dist) * strength;
-    this.ball.vy += (dy / dist) * strength;
-    this.touch(p);
   }
 
   private touch(p: MatchPlayer): void {

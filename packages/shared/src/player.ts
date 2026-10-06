@@ -76,6 +76,52 @@ export function applyControls(p: ControlledPlayer, dashCooldownTicks: number): v
   p.dashQueued = false;
 }
 
+export function createBall(): Disc {
+  return {
+    x: 0,
+    y: 0,
+    vx: 0,
+    vy: 0,
+    radius: PHYSICS.ball.radius,
+    invMass: PHYSICS.ball.invMass,
+    bCoef: PHYSICS.ball.bCoef,
+    damping: PHYSICS.ball.damping,
+  };
+}
+
+/**
+ * Chute de um tick: segurando o botão (ou num toque rápido) chuta uma vez
+ * quando a bola está ao alcance; só chuta de novo depois de soltar.
+ * Retorna true se chutou.
+ */
+export function applyKick(p: ControlledPlayer, ball: Disc): boolean {
+  const holdingKick = (p.input & Input.kick) !== 0;
+  let kicked = false;
+  if ((holdingKick || p.kickQueued) && !p.kickConsumed) {
+    const dx = ball.x - p.x;
+    const dy = ball.y - p.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist - p.radius - ball.radius < PHYSICS.player.kickRange) {
+      const strength = PHYSICS.player.kickStrength * ball.invMass;
+      ball.vx += (dx / (dist || 1)) * strength;
+      ball.vy += (dy / (dist || 1)) * strength;
+      p.kickConsumed = true;
+      kicked = true;
+    }
+  }
+  p.kickQueued = false;
+  if (!holdingKick) p.kickConsumed = false;
+  return kicked;
+}
+
+/** Colisão da bola com traves, linhas do campo e redes. */
+export function collideBallWithStadium(ball: Disc): void {
+  for (const post of STADIUM_GEOMETRY.posts) collideDiscs(post, ball);
+  for (const s of STADIUM_GEOMETRY.segments) {
+    if (s.mask & Mask.ball) collideSegment(ball, s);
+  }
+}
+
 /** Colisão do jogador com traves, redes e limite externo. */
 export function collidePlayerWithStadium(p: Disc): void {
   for (const post of STADIUM_GEOMETRY.posts) collideDiscs(post, p);

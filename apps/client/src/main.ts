@@ -222,14 +222,16 @@ function onSnapForPrediction(snap: Snapshot) {
     predictor.reset();
     return;
   }
-  predictor.onServerState(mine, me.team, snap.ph, snap.ko, dashCooldownTicks());
+  predictor.onServerState(snap, mine, me.team, dashCooldownTicks());
 }
 
-/** Troca a pose do próprio jogador (atrasada) pela prevista (na hora). */
+/** Troca o próprio jogador e a bola (atrasados) pelos previstos (na hora). */
 function applyPrediction(frame: Frame, trail: Frame[], myNum: number) {
   const pose = predictor.pose();
-  if (!pose || !frame.players.has(myNum)) return;
+  const ball = predictor.ballPose();
+  if (!pose || !ball || !frame.players.has(myNum)) return;
   frame.players.set(myNum, pose);
+  frame.ball = ball;
   trail.forEach((past, i) => {
     const pos = predictor.poseAgo(TRAIL_TICKS[i]!);
     const old = past.players.get(myNum);

@@ -1,30 +1,39 @@
 import {
   type ControlledPlayer,
+  type Disc,
   Input,
   type MatchPhase,
   PlayerFlag,
   type PlayerSnap,
   type PlayingTeam,
+  type Snapshot,
   TICK_MS,
   applyControls,
+  applyKick,
   applyKickoffLimits,
+  collideBallWithStadium,
+  collideDiscs,
   collidePlayerWithStadium,
+  createBall,
   createPlayer,
   integrate,
   pressInput,
 } from "@futbotao/shared";
 import type { PlayerPose } from "./timeline";
 
-/** Estado do próprio jogador depois de cada tick local. */
-interface TickRecord {
-  input: number;
-  simulated: boolean;
+interface BodyState {
   x: number;
   y: number;
   vx: number;
   vy: number;
-  dashCooldown: number;
-  dashTicks: number;
+}
+
+/** Estado do próprio jogador e da bola depois de cada tick local. */
+interface TickRecord {
+  input: number;
+  simulated: boolean;
+  me: BodyState & { dashCooldown: number; dashTicks: number };
+  ball: BodyState;
 }
 
 const HISTORY_TICKS = 240;
@@ -33,21 +42,67 @@ const MAX_STEPS_PER_FRAME = 10;
 const SNAP_DISTANCE = 80;
 /** Quanto do erro de posição sobra a cada tick (suaviza as correções). */
 const SMOOTHING = 0.85;
+const POS_TOLERANCE = 0.5;
+const VEL_TOLERANCE = 0.05;
 
 const isSimulated = (phase: MatchPhase) => phase === "playing" || phase === "goal";
+const body = (d: Disc): BodyState => ({ x: d.x, y: d.y, vx: d.vx, vy: d.vy });
+const setBody = (d: Disc, s: BodyState) => {
+  d.x = s.x;
+  d.y = s.y;
+  d.vx = s.vx;
+  d.vy = s.vy;
+};
+const differs = (a: BodyState, b: BodyState) =>
+  Math.hypot(a.x - b.x, a.y - b.y) > POS_TOLERANCE ||
+  Math.abs(a.vx - b.vx) + Math.abs(a.vy - b.vy) > VEL_TOLERANCE;
+
+/** Desenho suave de um corpo previsto: interpola entre ticks e esconde correções. */
+class Smoothed {
+  prev = { x: 0, y: 0 };
+  offset = { x: 0, y: 0 };
+
+  reset(d: Disc) {
+    this.prev = { x: d.x, y: d.y };
+    this.offset = { x: 0, y: 0 };
+  }
+
+  /** Guarda o quanto a posição "pulou" para escorregar até a nova. */
+  addCorrection(before: { x: number; y: number }, after: Disc) {
+    this.offset.x += before.x - after.x;
+    this.offset.y += before.y - after.y;
+    if (Math.hypot(this.offset.x, this.offset.y) > SNAP_DISTANCE) this.offset = { x: 0, y: 0 };
+  }
+
+  decay() {
+    this.offset.x *= SMOOTHING;
+    this.offset.y *= SMOOTHING;
+  }
+
+  render(d: Disc, t: number) {
+    return {
+      x: this.prev.x + (d.x - this.prev.x) * t + this.offset.x,
+      y: this.prev.y + (d.y - this.prev.y) * t + this.offset.y,
+    };
+  }
+}
 
 /**
- * Predição do próprio jogador: o movimento acontece na hora no navegador,
- * com a mesma física do servidor. Quando o servidor responde, o estado dele
- * vira a base e os comandos ainda não confirmados são reaplicados por cima.
+ * Predição do próprio jogador e da bola: movimento, condução e chute
+ * acontecem na hora no navegador, com a mesma física do servidor. Quando o
+ * servidor responde, o estado dele vira a base e os comandos ainda não
+ * confirmados são reaplicados por cima.
+ *
+ * Os outros jogadores não são previstos (aparecem com o atraso da rede).
  */
 export class Predictor {
   private me: ControlledPlayer | null = null;
+  private readonly ball = createBall();
+  private readonly meSmooth = new Smoothed();
+  private readonly ballSmooth = new Smoothed();
   private tick = 0;
   private accumulator = 0;
   private lastTime: number | null = null;
-  private prev = { x: 0, y: 0 };
-  private offset = { x: 0, y: 0 };
   private nextInput = 0;
   private seq = 0;
   private readonly seqTick = new Map<number, number>();
@@ -63,18 +118,19 @@ export class Predictor {
     this.nextInput = bits;
     this.seq++;
     this.seqTick.set(this.seq, this.tick + 1);
-    if (this.seqTick.size > 500) {
-      const oldest = this.seqTick.keys().next().value!;
-      this.seqTick.delete(oldest);
-    }
+    if (this.seqTick.size > 500) this.seqTick.delete(this.seqTick.keys().next().value!);
     return this.seq;
   }
 
   reset() {
     this.me = null;
     this.history.clear();
-    this.offset = { x: 0, y: 0 };
     this.lastTime = null;
+  }
+
+  /** Tamanho da correção visual pendente do jogador (usado nos testes). */
+  get correction(): number {
+    return Math.hypot(this.meSmooth.offset.x, this.meSmooth.offset.y);
   }
 
   /** Avança a simulação local em passos fixos de 60Hz. */
@@ -96,119 +152,129 @@ export class Predictor {
     if (steps === MAX_STEPS_PER_FRAME) this.accumulator = 0;
   }
 
-  /** Recebe o estado oficial do próprio jogador vindo do servidor. */
-  onServerState(
-    snap: PlayerSnap,
-    team: PlayingTeam,
-    phase: MatchPhase,
-    kickoff: PlayingTeam | null,
-    cooldownTicks: number,
-  ) {
-    const [, x, y, flags, dashCooldown, vx, vy, ackSeq, ackSteps] = snap;
-    this.phase = phase;
-    this.kickoff = kickoff;
+  /** Recebe um snapshot do servidor com o estado oficial. */
+  onServerState(snap: Snapshot, mine: PlayerSnap, team: PlayingTeam, cooldownTicks: number) {
+    const [, x, y, flags, dashCooldown, vx, vy, ackSeq, ackSteps] = mine;
+    this.phase = snap.ph;
+    this.kickoff = snap.ko;
     this.cooldownTicks = cooldownTicks;
     this.serverKickArmed = (flags & PlayerFlag.kickArmed) !== 0;
     this.serverAck = ackSeq;
 
-    const server = { x, y, vx, vy, dashCooldown };
+    const serverMe = { x, y, vx, vy };
+    const serverBall = { x: snap.b[0], y: snap.b[1], vx: snap.b[2], vy: snap.b[3] };
+
     if (!this.me || this.me.team !== team) {
       this.me = createPlayer(team, x, y);
       this.me.input = this.nextInput;
-      this.history.clear();
-      this.rebase(server);
-      this.resetHistory();
+      this.acceptServer(serverMe, serverBall, dashCooldown);
       return;
     }
 
     const firstTick = ackSeq > 0 ? this.seqTick.get(ackSeq) : undefined;
     if (firstTick === undefined) {
       // Sem como alinhar os tempos: só aceita o servidor se não há comando no caminho.
-      if (ackSeq === this.seq) {
-        this.rebase(server);
-        this.resetHistory();
-      }
+      if (ackSeq === this.seq) this.acceptServer(serverMe, serverBall, dashCooldown);
       return;
     }
     const at = firstTick + ackSteps - 1;
     const record = this.history.get(at);
     if (at > this.tick || !record) {
-      this.rebase(server);
-      this.resetHistory();
+      this.acceptServer(serverMe, serverBall, dashCooldown);
       return;
     }
 
-    const posError = Math.hypot(record.x - x, record.y - y);
-    const velError = Math.abs(record.vx - vx) + Math.abs(record.vy - vy);
-    if (posError < 0.5 && velError < 0.05 && record.dashCooldown === dashCooldown) return;
+    if (
+      !differs(record.me, serverMe) &&
+      !differs(record.ball, serverBall) &&
+      record.me.dashCooldown === dashCooldown
+    ) {
+      return;
+    }
 
-    // Previsão errou (ex.: trombada com alguém): refaz a partir do estado oficial.
-    const before = { x: this.me.x, y: this.me.y };
-    this.rebase({ ...server, dashTicks: record.dashTicks, input: record.input });
+    // Previsão errou (trombada, alguém tocou na bola...): refaz a partir do oficial.
+    const me = this.me;
+    const meBefore = { x: me.x, y: me.y };
+    const ballBefore = { x: this.ball.x, y: this.ball.y };
+    setBody(me, serverMe);
+    setBody(this.ball, serverBall);
+    me.dashCooldown = dashCooldown;
+    me.dashTicks = record.me.dashTicks;
+    me.input = record.input;
+    me.kickConsumed = (record.input & Input.kick) !== 0 && !this.serverKickArmed;
+    me.dashQueued = false;
+    me.kickQueued = false;
+    this.record(at, record.input, record.simulated);
     for (let t = at + 1; t <= this.tick; t++) {
       const rec = this.history.get(t);
       if (!rec) break;
       this.simulate(rec.input, rec.simulated);
       this.record(t, rec.input, rec.simulated);
     }
-    this.offset.x += before.x - this.me.x;
-    this.offset.y += before.y - this.me.y;
-    if (Math.hypot(this.offset.x, this.offset.y) > SNAP_DISTANCE) this.offset = { x: 0, y: 0 };
+    this.meSmooth.addCorrection(meBefore, me);
+    this.ballSmooth.addCorrection(ballBefore, this.ball);
   }
 
   /** Pose do próprio jogador para desenhar agora, ou null se não está jogando. */
   pose(): PlayerPose | null {
     const me = this.me;
     if (!me) return null;
-    const t = Math.min(1, this.accumulator / TICK_MS);
     let flags = 0;
-    const holdingKick = (me.input & Input.kick) !== 0;
     // Enquanto o servidor não viu o aperto, confia no teclado; depois, no servidor.
-    if (holdingKick && (this.serverAck < this.seq || this.serverKickArmed)) {
+    if (me.input & Input.kick && (this.serverAck < this.seq || this.serverKickArmed)) {
       flags |= PlayerFlag.kickArmed;
     }
     if (me.dashTicks > 0) flags |= PlayerFlag.dashing;
-    return {
-      x: this.prev.x + (me.x - this.prev.x) * t + this.offset.x,
-      y: this.prev.y + (me.y - this.prev.y) * t + this.offset.y,
-      flags,
-      cooldown: me.dashCooldown,
-    };
+    return { ...this.meSmooth.render(me, this.frac()), flags, cooldown: me.dashCooldown };
   }
 
-  /** Tamanho da correção visual pendente (usado nos testes). */
-  get correction(): number {
-    return Math.hypot(this.offset.x, this.offset.y);
+  /** Posição prevista da bola para desenhar agora. */
+  ballPose(): { x: number; y: number } | null {
+    return this.me ? this.ballSmooth.render(this.ball, this.frac()) : null;
   }
 
-  /** Posição de alguns ticks atrás (rastro do dash). */
+  /** Posição do jogador alguns ticks atrás (rastro do dash). */
   poseAgo(ticks: number): { x: number; y: number } | null {
     const rec = this.history.get(this.tick - ticks);
-    return rec ? { x: rec.x + this.offset.x, y: rec.y + this.offset.y } : null;
+    if (!rec) return null;
+    const { offset } = this.meSmooth;
+    return { x: rec.me.x + offset.x, y: rec.me.y + offset.y };
+  }
+
+  private frac(): number {
+    return Math.min(1, this.accumulator / TICK_MS);
   }
 
   private step() {
     this.tick++;
     const simulated = isSimulated(this.phase);
-    this.prev = { x: this.me!.x, y: this.me!.y };
+    this.meSmooth.prev = { x: this.me!.x, y: this.me!.y };
+    this.ballSmooth.prev = { x: this.ball.x, y: this.ball.y };
     this.simulate(this.nextInput, simulated);
     this.record(this.tick, this.nextInput, simulated);
     this.history.delete(this.tick - HISTORY_TICKS);
-    this.offset.x *= SMOOTHING;
-    this.offset.y *= SMOOTHING;
+    this.meSmooth.decay();
+    this.ballSmooth.decay();
   }
 
+  /** Um tick da física na mesma ordem do servidor, só com o próprio jogador e a bola. */
   private simulate(input: number, simulated: boolean) {
     const p = this.me!;
+    const ball = this.ball;
     if (input !== p.input) pressInput(p, input);
-    // Durante replay/fim de jogo o servidor congela os jogadores; aqui também.
+    // Durante replay/fim de jogo o servidor congela tudo; aqui também.
     if (!simulated) return;
     applyControls(p, this.cooldownTicks);
-    p.kickQueued = false;
-    if (!(p.input & Input.kick)) p.kickConsumed = false;
+    applyKick(p, ball);
+    integrate(ball);
     integrate(p);
+    collideDiscs(p, ball);
+    collideBallWithStadium(ball);
     collidePlayerWithStadium(p);
-    if (this.kickoff && this.phase === "playing") applyKickoffLimits(p, this.kickoff);
+    if (this.kickoff && this.phase === "playing") {
+      if (ball.vx !== 0 || ball.vy !== 0) this.kickoff = null;
+      else applyKickoffLimits(p, this.kickoff);
+    }
   }
 
   private record(tick: number, input: number, simulated: boolean) {
@@ -216,41 +282,21 @@ export class Predictor {
     this.history.set(tick, {
       input,
       simulated,
-      x: p.x,
-      y: p.y,
-      vx: p.vx,
-      vy: p.vy,
-      dashCooldown: p.dashCooldown,
-      dashTicks: p.dashTicks,
+      me: { ...body(p), dashCooldown: p.dashCooldown, dashTicks: p.dashTicks },
+      ball: body(this.ball),
     });
   }
 
-  private rebase(s: {
-    x: number;
-    y: number;
-    vx: number;
-    vy: number;
-    dashCooldown: number;
-    dashTicks?: number;
-    input?: number;
-  }) {
+  /** Aceita a posição do servidor sem reaplicar comandos (sem como alinhar os tempos). */
+  private acceptServer(me: BodyState, ball: BodyState, dashCooldown: number) {
     const p = this.me!;
-    p.x = s.x;
-    p.y = s.y;
-    p.vx = s.vx;
-    p.vy = s.vy;
-    p.dashCooldown = s.dashCooldown;
-    if (s.dashTicks !== undefined) p.dashTicks = s.dashTicks;
-    if (s.input !== undefined) p.input = s.input;
+    setBody(p, me);
+    setBody(this.ball, ball);
+    p.dashCooldown = dashCooldown;
     p.dashQueued = false;
     p.kickQueued = false;
-  }
-
-  /** Depois de aceitar a posição do servidor sem reaplicar comandos. */
-  private resetHistory() {
-    const p = this.me!;
-    this.prev = { x: p.x, y: p.y };
-    this.offset = { x: 0, y: 0 };
+    this.meSmooth.reset(p);
+    this.ballSmooth.reset(this.ball);
     this.record(this.tick, p.input, isSimulated(this.phase));
   }
 }

@@ -1,9 +1,22 @@
-import { DEFAULT_SETTINGS, Input, Match, type Snapshot, TICK_MS, TICK_RATE } from "@futbotao/shared";
+import {
+  DEFAULT_SETTINGS,
+  Input,
+  Match,
+  PHYSICS,
+  type Snapshot,
+  TICK_MS,
+  TICK_RATE,
+} from "@futbotao/shared";
 import { describe, expect, it } from "vitest";
 import { Predictor } from "./predict";
 
-/** Simula cliente e servidor a 60Hz com latência fixa nas duas direções. */
-function simulate(script: (tick: number) => number | null, ticks: number, latencyTicks: number) {
+type Script = (tick: number) => number | null;
+
+/**
+ * Simula cliente e servidor a 60Hz com latência fixa nas duas direções.
+ * `other` controla o adversário direto no servidor (o cliente não prevê ele).
+ */
+function simulate(script: Script, ticks: number, latencyTicks: number, other?: Script) {
   const match = new Match(DEFAULT_SETTINGS);
   match.addPlayer("me", 1, "Eu", "moscow");
   match.addPlayer("other", 2, "Outro", "cairo");
@@ -13,32 +26,47 @@ function simulate(script: (tick: number) => number | null, ticks: number, latenc
   const toClient: { at: number; snap: Snapshot }[] = [];
   const cooldown = DEFAULT_SETTINGS.dashCooldownSec * TICK_RATE;
   let maxCorrection = 0;
+  let minBallGap = Infinity;
 
   for (let t = 0; t < ticks; t++) {
-    // Servidor: aplica comandos que chegaram e avança.
     while (toServer[0] && toServer[0].at <= t) {
       const m = toServer.shift()!;
       match.setInput("me", m.bits, m.seq);
     }
+    const otherBits = other?.(t);
+    if (otherBits !== undefined && otherBits !== null) match.setInput("other", otherBits);
     match.step();
     toClient.push({ at: t + latencyTicks, snap: match.snapshot() });
 
-    // Cliente: recebe snapshots, lê teclado e avança a predição.
     while (toClient[0] && toClient[0].at <= t) {
       const { snap } = toClient.shift()!;
-      predictor.onServerState(snap.p.find((p) => p[0] === 1)!, "moscow", snap.ph, snap.ko, cooldown);
+      predictor.onServerState(snap, snap.p.find((p) => p[0] === 1)!, "moscow", cooldown);
       maxCorrection = Math.max(maxCorrection, predictor.correction);
     }
     const bits = script(t);
     if (bits !== null) toServer.push({ at: t + latencyTicks, bits, seq: predictor.setInput(bits) });
     predictor.update(t * TICK_MS + 0.5);
+
+    const me = predictor.pose();
+    const ball = predictor.ballPose();
+    if (me && ball) minBallGap = Math.min(minBallGap, Math.hypot(me.x - ball.x, me.y - ball.y));
   }
-  return { match, predictor, maxCorrection };
+  return { match, predictor, maxCorrection, minBallGap };
+}
+
+const touching = PHYSICS.player.radius + PHYSICS.ball.radius;
+
+function expectAgreement(match: Match, predictor: Predictor) {
+  const server = match.players.get("me")!;
+  const pose = predictor.pose()!;
+  const ball = predictor.ballPose()!;
+  expect(Math.hypot(pose.x - server.x, pose.y - server.y)).toBeLessThan(0.5);
+  expect(Math.hypot(ball.x - match.ball.x, ball.y - match.ball.y)).toBeLessThan(0.5);
 }
 
 describe("Predictor", () => {
   it("movimento, paredes e dash previstos batem com o servidor (sem correções)", () => {
-    // Longe da bola e do adversário: só física que o cliente também simula.
+    // Longe da bola e do adversário.
     const script = (t: number) => {
       if (t === 20) return Input.left;
       if (t === 120) return Input.left | Input.up;
@@ -49,10 +77,7 @@ describe("Predictor", () => {
     };
     const { match, predictor, maxCorrection } = simulate(script, 500, 7);
     expect(maxCorrection).toBeLessThan(0.5);
-    const server = match.players.get("me")!;
-    const pose = predictor.pose()!;
-    expect(Math.abs(pose.x - server.x)).toBeLessThan(0.5);
-    expect(Math.abs(pose.y - server.y)).toBeLessThan(0.5);
+    expectAgreement(match, predictor);
   });
 
   it("o jogador anda na hora, antes da resposta do servidor", () => {
@@ -63,12 +88,32 @@ describe("Predictor", () => {
     expect(predictor.pose()!.x).toBeGreaterThan(-180);
   });
 
-  it("corrige quando o servidor discorda (empurrando a bola) e converge", () => {
-    const script = (t: number) => (t === 10 ? Input.right : t === 160 ? 0 : null);
-    const { match, predictor, maxCorrection } = simulate(script, 500, 7);
-    expect(maxCorrection).toBeGreaterThan(0);
-    const server = match.players.get("me")!;
-    const pose = predictor.pose()!;
-    expect(Math.hypot(pose.x - server.x, pose.y - server.y)).toBeLessThan(0.5);
+  it("conduzir a bola: não atravessa a bola e bate com o servidor", () => {
+    // Conduz um pouco e solta (a bola para antes do gol: gol muda a fase da partida).
+    const script = (t: number) => (t === 10 ? Input.right : t === 80 ? 0 : null);
+    // Adversário sai do caminho da bola (colisão com ele o cliente não prevê).
+    const other = (t: number) => (t === 0 ? Input.up : t === 60 ? 0 : null);
+    const { match, predictor, maxCorrection, minBallGap } = simulate(script, 500, 7, other);
+    expect(minBallGap).toBeGreaterThan(touching - 1);
+    // Ao trocar de tecla, cliente e servidor podem contar um tick a mais/menos
+    // entre os comandos: no máximo ~1 tick de movimento, suavizado na tela.
+    expect(maxCorrection).toBeLessThan(3.5);
+    expectAgreement(match, predictor);
+  });
+
+  it("o chute sai na hora, antes da resposta do servidor", () => {
+    // Anda até a bola e chuta ao encostar.
+    const script = (t: number) => (t === 10 ? Input.right : t === 70 ? Input.right | Input.kick : null);
+    const { match, predictor } = simulate(script, 74, 7);
+    expect(match.ball.vx).toBe(0);
+    expect(predictor.ballPose()!.x).toBeGreaterThan(0);
+  });
+
+  it("adversário toca na bola: corrige e volta a concordar com o servidor", () => {
+    const script = (t: number) => (t === 10 ? Input.right : t === 120 ? 0 : null);
+    // O adversário vem de frente para a bola.
+    const other = (t: number) => (t === 10 ? Input.left : t === 120 ? 0 : null);
+    const { match, predictor } = simulate(script, 500, 7, other);
+    expectAgreement(match, predictor);
   });
 });
