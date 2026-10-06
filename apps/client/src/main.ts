@@ -1,6 +1,9 @@
 import "./style.css";
 import {
+  DEFAULT_ICE_SERVERS,
   type GoalInfo,
+  type HostMessage,
+  type IceServer,
   type LobbyState,
   type MatchResult,
   type PlayerInfo,
@@ -15,6 +18,7 @@ import { connect } from "./net";
 import { Panel } from "./panel";
 import { Predictor } from "./predict";
 import { type ChatBubble, Renderer } from "./render";
+import { type MatchSession, createSession } from "./session";
 import { playCrowd, playWhistle, unlockAudio } from "./sound";
 import { type Frame, ReplayPlayer, Timeline } from "./timeline";
 
@@ -23,6 +27,9 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 const NAME_KEY = "futbotao:name";
 const BUBBLE_MS = 2500;
 const TRAIL_TICKS = [3, 6, 9];
+/** Quanto a bola desenhada segue a prevista quando você é (ou deixa de ser) o mais perto. */
+const BALL_BLEND_SPEED = 0.15;
+const BALL_BLEND_MARGIN = 30;
 
 function readRoom(): string {
   const raw = new URLSearchParams(location.search).get("sala") ?? "moscairo";
@@ -53,6 +60,12 @@ const predictor = new Predictor();
 
 let myId: string | null = null;
 let myName = "";
+let ice: IceServer[] = DEFAULT_ICE_SERVERS;
+let session: MatchSession | null = null;
+/** Durante partida P2P o ping mostrado é o até o host, não o do servidor. */
+let sessionPing = false;
+/** 1 = bola prevista (você está com ela), 0 = bola do servidor (outro está). */
+let ballBlend = 0;
 let lobby: LobbyState | null = null;
 const playersByNum = new Map<number, PlayerInfo>();
 /** Time em que estávamos, para voltar a ele se a conexão cair. */
@@ -63,7 +76,6 @@ let replay: ReplayPlayer | null = null;
 let lastGoal: GoalInfo | null = null;
 let endedResult: MatchResult | null = null;
 let bubbles: ChatBubble[] = [];
-let ping: number | null = null;
 let toastTimer = 0;
 
 const net = connect(room, {
@@ -97,7 +109,7 @@ const panel = new Panel($("panel"), {
 
 const keyboard = listenKeyboard({
   enabled: () => isPlaying() && !panelOpen,
-  onChange: (bits) => net.send({ t: "input", i: bits, s: predictor.setInput(bits) }),
+  onChange: (bits) => session?.sendInput(bits, predictor.setInput(bits)),
   onQuickChat: (n) => net.send({ t: "chat", n }),
   onTogglePanel: () => {
     if (lobby?.phase === "match") setPanelOpen(!panelOpen);
@@ -133,12 +145,38 @@ function handleMessage(msg: ServerMessage) {
   switch (msg.t) {
     case "welcome":
       myId = msg.id;
+      ice = msg.ice?.length ? msg.ice : DEFAULT_ICE_SERVERS;
       break;
     case "lobby":
       onLobby(msg.s);
       break;
     case "snap":
-      timeline.push(msg.s, now);
+    case "goal":
+    case "ended":
+      handleMatchMessage(msg);
+      break;
+    case "signal":
+      session?.onSignal(msg.from, msg.data);
+      break;
+    case "chat":
+      bubbles = bubbles.filter((b) => b.num !== msg.num && b.until > now);
+      bubbles.push({ num: msg.num, index: msg.n, until: now + BUBBLE_MS });
+      break;
+    case "pong":
+      if (!sessionPing) $("ping").textContent = `ping ${Math.round(now - msg.c)} ms`;
+      break;
+    case "error":
+      toast(msg.message);
+      break;
+  }
+}
+
+/** Snapshots e eventos da partida (do servidor, do host P2P ou do próprio Worker). */
+function handleMatchMessage(msg: HostMessage) {
+  const now = performance.now();
+  switch (msg.t) {
+    case "snap":
+      if (!timeline.push(msg.s, now)) return;
       onSnapForPrediction(msg.s);
       if (msg.s.ph === "replay") {
         if (!replay && lastGoal) {
@@ -150,24 +188,37 @@ function handleMessage(msg: ServerMessage) {
       break;
     case "goal":
       lastGoal = msg.g;
+      $("score-moscow").textContent = String(msg.g.score.moscow);
+      $("score-cairo").textContent = String(msg.g.score.cairo);
       playCrowd();
       break;
     case "ended":
       endedResult = msg.r;
       playWhistle(true);
       break;
-    case "chat":
-      bubbles = bubbles.filter((b) => b.num !== msg.num && b.until > now);
-      bubbles.push({ num: msg.num, index: msg.n, until: now + BUBBLE_MS });
-      break;
-    case "pong":
-      ping = Math.round(now - msg.c);
-      $("ping").textContent = `ping ${ping} ms`;
-      break;
-    case "error":
-      toast(msg.message);
-      break;
   }
+}
+
+function startSession(state: LobbyState) {
+  if (!myId) return;
+  session = createSession(state, {
+    myId,
+    ice,
+    sendServer: (msg) => net.send(msg),
+    onMatchMessage: handleMatchMessage,
+    onStatus: (text) => setText("net-status", text),
+    onPing: (ms, label) => {
+      sessionPing = true;
+      $("ping").textContent = ms ? `ping ${ms} ms (${label})` : label;
+    },
+  });
+}
+
+function stopSession() {
+  session?.close();
+  session = null;
+  sessionPing = false;
+  setText("net-status", null);
 }
 
 function onLobby(state: LobbyState) {
@@ -195,7 +246,11 @@ function onLobby(state: LobbyState) {
     setPanelOpen(false);
     playWhistle();
   }
-  if (state.phase !== "match") {
+  if (state.phase === "match") {
+    if (!session) startSession(state);
+    else session.onLobby(state);
+  } else {
+    if (session) stopSession();
     replay = null;
     endedResult = null;
   }
@@ -225,13 +280,28 @@ function onSnapForPrediction(snap: Snapshot) {
   predictor.onServerState(snap, mine, me.team, dashCooldownTicks());
 }
 
-/** Troca o próprio jogador e a bola (atrasados) pelos previstos (na hora). */
+/**
+ * Troca o próprio jogador (atrasado) pelo previsto (na hora). A bola prevista
+ * só é usada quando você é quem está mais perto dela: se outro jogador está
+ * com a bola, ela continua "colada" nele como chegou da rede.
+ */
 function applyPrediction(frame: Frame, trail: Frame[], myNum: number) {
   const pose = predictor.pose();
-  const ball = predictor.ballPose();
-  if (!pose || !ball || !frame.players.has(myNum)) return;
+  const predictedBall = predictor.ballPose();
+  if (!pose || !predictedBall || !frame.players.has(myNum)) return;
   frame.players.set(myNum, pose);
-  frame.ball = ball;
+
+  const myDist = Math.hypot(pose.x - predictedBall.x, pose.y - predictedBall.y);
+  let otherDist = Infinity;
+  for (const [num, p] of frame.players) {
+    if (num !== myNum) otherDist = Math.min(otherDist, Math.hypot(p.x - frame.ball.x, p.y - frame.ball.y));
+  }
+  const target = Math.min(1, Math.max(0, (otherDist - myDist) / BALL_BLEND_MARGIN + 0.5));
+  ballBlend += (target - ballBlend) * BALL_BLEND_SPEED;
+  frame.ball = {
+    x: frame.ball.x + (predictedBall.x - frame.ball.x) * ballBlend,
+    y: frame.ball.y + (predictedBall.y - frame.ball.y) * ballBlend,
+  };
   trail.forEach((past, i) => {
     const pos = predictor.poseAgo(TRAIL_TICKS[i]!);
     const old = past.players.get(myNum);

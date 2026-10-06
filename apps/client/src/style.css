@@ -228,6 +228,20 @@ button.small {
   white-space: nowrap;
 }
 
+#net-status {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(560px, calc(100% - 32px));
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid var(--accent);
+  text-align: center;
+  font-size: 14px;
+}
+
 #toast {
   position: absolute;
   top: 14px;

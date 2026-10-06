@@ -1,7 +1,15 @@
 export type PlayingTeam = "moscow" | "cairo";
 export type Team = PlayingTeam | "spectator";
 
+/**
+ * Onde a partida roda:
+ * - "p2p": no navegador de quem criou a sala; os outros conectam direto nele (WebRTC).
+ * - "server": no servidor da Cloudflare (reserva, para redes que bloqueiam P2P).
+ */
+export type NetworkMode = "p2p" | "server";
+
 export interface RoomSettings {
+  network: NetworkMode;
   timeLimitMin: number;
   /** 0 = sem limite de gols. */
   scoreLimit: number;
@@ -43,6 +51,8 @@ export interface MatchResult {
 export interface LobbyState {
   phase: RoomPhase;
   hostId: string | null;
+  /** Quem roda a partida atual no modo P2P (null no modo servidor ou fora de partida). */
+  matchHostId: string | null;
   players: PlayerInfo[];
   settings: RoomSettings;
   score: Score;
@@ -88,7 +98,24 @@ export interface GoalInfo {
   score: Score;
 }
 
-// ---- Mensagens ----
+// ---- Mensagens com o servidor (lobby, sinalização e modo servidor) ----
+
+/** Dados de sinalização WebRTC repassados pelo servidor entre dois navegadores. */
+export type SignalData =
+  | { sdp: { type: "offer" | "answer"; sdp: string } }
+  | { candidate: { candidate: string; sdpMid: string | null; sdpMLineIndex: number | null } };
+
+/** O host P2P avisa o servidor do que importa para o lobby. */
+export type HostEvent =
+  | { type: "goal"; goal: GoalInfo }
+  | { type: "ended"; result: MatchResult }
+  | { type: "finished" };
+
+export interface IceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
 
 export type ClientMessage =
   | { t: "join"; name: string }
@@ -98,14 +125,27 @@ export type ClientMessage =
   /** `s` numera os comandos para a predição no cliente. */
   | { t: "input"; i: number; s: number }
   | { t: "chat"; n: number }
-  | { t: "ping"; c: number };
+  | { t: "ping"; c: number }
+  | { t: "signal"; to: string; data: SignalData }
+  | { t: "hostEvent"; e: HostEvent };
 
 export type ServerMessage =
-  | { t: "welcome"; id: string }
+  | { t: "welcome"; id: string; ice: IceServer[] }
   | { t: "lobby"; s: LobbyState }
   | { t: "snap"; s: Snapshot }
   | { t: "goal"; g: GoalInfo }
   | { t: "ended"; r: MatchResult }
   | { t: "chat"; num: number; n: number }
   | { t: "pong"; c: number }
+  | { t: "signal"; from: string; data: SignalData }
   | { t: "error"; message: string };
+
+// ---- Mensagens P2P entre o host e os outros navegadores ----
+
+export type GuestMessage = { t: "input"; i: number; s: number } | { t: "ping"; c: number };
+
+export type HostMessage =
+  | { t: "snap"; s: Snapshot }
+  | { t: "goal"; g: GoalInfo }
+  | { t: "ended"; r: MatchResult }
+  | { t: "pong"; c: number };

@@ -68,16 +68,18 @@ export class Timeline {
   /** Hora local (ms) em que o tick 0 teria chegado. */
   private offset: number | null = null;
 
-  push(snap: Snapshot, now: number) {
+  /** Guarda um snapshot. Retorna false se ele chegou atrasado (fora de ordem) e foi ignorado. */
+  push(snap: Snapshot, now: number): boolean {
     const last = this.frames[this.frames.length - 1];
-    // Partida nova: o tick volta a zero.
-    if (last && snap.k <= last.k) this.reset();
+    // No P2P os snapshots vêm sem garantia de ordem: os atrasados são descartados.
+    if (last && snap.k <= last.k) return false;
     this.frames.push(snap);
     if (this.frames.length > MAX_FRAMES) this.frames.splice(0, this.frames.length - MAX_FRAMES);
 
     const candidate = now - snap.k * TICK_MS;
     if (this.offset === null || candidate < this.offset) this.offset = candidate;
     else this.offset += (candidate - this.offset) * 0.02;
+    return true;
   }
 
   reset() {

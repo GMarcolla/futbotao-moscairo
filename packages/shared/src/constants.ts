@@ -87,6 +87,7 @@ export const REPLAY = {
 } as const;
 
 export const DEFAULT_SETTINGS: RoomSettings = {
+  network: "p2p",
   timeLimitMin: 3,
   scoreLimit: 3,
   dashCooldownSec: 10,
@@ -107,3 +108,9 @@ export const TEAMS: Record<PlayingTeam, { name: string; color: string; side: -1 
 export const QUICK_CHAT = ["Passa!", "Boa!", "Foi mal 😅", "GOOOL!"] as const;
 
 export const NAME_MAX_LENGTH = 16;
+
+/** Usados quando o servidor não tem TURN configurado (só conexão direta). */
+export const DEFAULT_ICE_SERVERS = [
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun.l.google.com:19302" },
+];

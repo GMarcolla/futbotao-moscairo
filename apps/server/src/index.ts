@@ -1,6 +1,9 @@
 import {
   type ClientMessage,
+  DEFAULT_ICE_SERVERS,
   DEFAULT_SETTINGS,
+  type HostEvent,
+  type IceServer,
   type LobbyState,
   Match,
   type MatchEvent,
@@ -12,6 +15,7 @@ import {
   type RoomPhase,
   type RoomSettings,
   SETTINGS_LIMITS,
+  type Score,
   type ServerMessage,
   TICK_MS,
   TIMING,
@@ -30,11 +34,21 @@ interface PlayerState {
 
 type PlayerConnection = Connection<PlayerState>;
 
+/** Estado da partida P2P guardado no storage: o objeto hiberna durante o jogo. */
+interface P2PMatchState {
+  matchHostId: string;
+  score: Score;
+}
+
 const MAX_STEPS_PER_LOOP = 5;
+const ICE_TTL_SECONDS = 12 * 60 * 60;
 
 /**
- * Uma sala = um Durable Object. Fora da partida ele hiberna (não consome
- * cota de tempo); durante a partida o loop de 60Hz o mantém acordado.
+ * Uma sala = um Durable Object. Cuida do lobby e da sinalização WebRTC.
+ *
+ * - Modo P2P (padrão): a partida roda no navegador de quem criou a sala; aqui
+ *   só se repassa a sinalização e se guarda o placar. O objeto hiberna no jogo.
+ * - Modo servidor (reserva): a partida roda aqui num loop de 60Hz.
  */
 export class Room extends Server<Env> {
   static override options = { hibernate: true };
@@ -48,20 +62,36 @@ export class Room extends Server<Env> {
   private loopAccumulator = 0;
   private countdown: ReturnType<typeof setTimeout> | null = null;
   private countdownEndsAt = 0;
+  private p2p: P2PMatchState | null = null;
+  private iceCache: { servers: IceServer[]; expiresAt: number } | null = null;
 
   override async onStart() {
     const saved = await this.ctx.storage.get<RoomSettings>("settings");
-    if (saved) this.settings = saved;
+    if (saved) this.settings = { ...DEFAULT_SETTINGS, ...saved };
+    this.lastResult = (await this.ctx.storage.get<MatchResult>("lastResult")) ?? null;
+    const p2p = await this.ctx.storage.get<P2PMatchState>("p2p");
+    // Acordou da hibernação no meio de uma partida P2P.
+    if (p2p && this.getConnection(p2p.matchHostId)) {
+      this.p2p = p2p;
+      this.phase = "match";
+    } else if (p2p) {
+      await this.ctx.storage.delete("p2p");
+    }
   }
 
-  override onConnect(conn: PlayerConnection) {
-    this.send(conn, { t: "welcome", id: conn.id });
+  override async onConnect(conn: PlayerConnection) {
+    this.send(conn, { t: "welcome", id: conn.id, ice: await this.iceServers() });
     this.send(conn, { t: "lobby", s: this.lobbyState() });
   }
 
   override onClose(conn: PlayerConnection) {
     if (!conn.state) return;
     this.match?.removePlayer(conn.id);
+    if (this.p2p?.matchHostId === conn.id) {
+      this.broadcastMsg({ t: "error", message: "Quem hospedava a partida saiu. Partida encerrada." });
+      this.finishMatch();
+      return;
+    }
     this.afterRosterChange();
   }
 
@@ -100,6 +130,17 @@ export class Room extends Server<Env> {
         if (Number.isInteger(msg.n) && msg.n >= 0 && msg.n < QUICK_CHAT.length) {
           this.broadcastMsg({ t: "chat", num: state.num, n: msg.n });
         }
+        break;
+      case "signal": {
+        // Repassa ofertas/respostas/candidatos WebRTC só entre o host e os outros.
+        const hostId = this.p2p?.matchHostId;
+        if (!hostId || (conn.id !== hostId && msg.to !== hostId)) return;
+        const target = this.getConnection<PlayerState>(msg.to);
+        if (target) this.send(target, { t: "signal", from: conn.id, data: msg.data });
+        break;
+      }
+      case "hostEvent":
+        if (this.p2p?.matchHostId === conn.id) this.handleHostEvent(msg.e);
         break;
     }
   }
@@ -150,6 +191,7 @@ export class Room extends Server<Env> {
         ? Math.min(lim.max, Math.max(lim.min, Math.round(v)))
         : fallback;
     this.settings = {
+      network: s.network === "server" ? "server" : "p2p",
       timeLimitMin: clamp(s.timeLimitMin, SETTINGS_LIMITS.timeLimitMin, this.settings.timeLimitMin),
       scoreLimit: clamp(s.scoreLimit, SETTINGS_LIMITS.scoreLimit, this.settings.scoreLimit),
       dashCooldownSec: clamp(
@@ -195,6 +237,15 @@ export class Room extends Server<Env> {
     this.countdown = null;
     this.phase = "match";
     this.lastResult = null;
+    void this.ctx.storage.delete("lastResult");
+    const hostId = this.hostId();
+    if (this.settings.network === "p2p" && hostId) {
+      // O navegador do host roda a partida; os outros conectam nele.
+      this.p2p = { matchHostId: hostId, score: { moscow: 0, cairo: 0 } };
+      void this.ctx.storage.put("p2p", this.p2p);
+      this.broadcastLobby();
+      return;
+    }
     this.match = new Match({ ...this.settings });
     for (const c of this.joined()) {
       const s = c.state!;
@@ -242,10 +293,32 @@ export class Room extends Server<Env> {
     }
   }
 
+  private handleHostEvent(e: HostEvent) {
+    const p2p = this.p2p!;
+    switch (e?.type) {
+      case "goal":
+        p2p.score = { moscow: e.goal.score.moscow | 0, cairo: e.goal.score.cairo | 0 };
+        void this.ctx.storage.put("p2p", p2p);
+        this.broadcastLobby();
+        break;
+      case "ended":
+        this.lastResult = e.result;
+        void this.ctx.storage.put("lastResult", e.result);
+        break;
+      case "finished":
+        this.finishMatch();
+        break;
+    }
+  }
+
   private finishMatch() {
     if (this.loop) clearInterval(this.loop);
     this.loop = null;
     this.match = null;
+    if (this.p2p) {
+      this.p2p = null;
+      void this.ctx.storage.delete("p2p");
+    }
     this.phase = "lobby";
     for (const c of this.joined()) {
       if (c.state!.ready) c.setState({ ...c.state!, ready: false });
@@ -290,13 +363,54 @@ export class Room extends Server<Env> {
     return {
       phase: this.phase,
       hostId: this.hostId(),
+      matchHostId: this.p2p?.matchHostId ?? null,
       players,
       settings: this.settings,
-      score: this.match ? { ...this.match.score } : { moscow: 0, cairo: 0 },
+      score: this.match
+        ? { ...this.match.score }
+        : (this.p2p?.score ?? { moscow: 0, cairo: 0 }),
       countdownMs:
         this.phase === "countdown" ? Math.max(0, this.countdownEndsAt - Date.now()) : null,
       lastResult: this.lastResult,
     };
+  }
+
+  /**
+   * Servidores ICE para o WebRTC. Com os segredos TURN_KEY_ID e TURN_KEY_API_TOKEN
+   * configurados, inclui o TURN da Cloudflare (para redes que bloqueiam conexão direta).
+   */
+  private async iceServers(): Promise<IceServer[]> {
+    const { TURN_KEY_ID, TURN_KEY_API_TOKEN } = this.env as Env & {
+      TURN_KEY_ID?: string;
+      TURN_KEY_API_TOKEN?: string;
+    };
+    if (!TURN_KEY_ID || !TURN_KEY_API_TOKEN) return DEFAULT_ICE_SERVERS;
+    if (this.iceCache && this.iceCache.expiresAt > Date.now()) return this.iceCache.servers;
+    try {
+      const res = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${TURN_KEY_ID}/credentials/generate-ice-servers`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${TURN_KEY_API_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ ttl: ICE_TTL_SECONDS }),
+        },
+      );
+      if (!res.ok) throw new Error(`TURN ${res.status}`);
+      const { iceServers } = (await res.json()) as { iceServers: IceServer[] };
+      // A porta 53 alternativa é bloqueada pelos navegadores e só atrasa a conexão.
+      const servers = iceServers.map((s) => ({
+        ...s,
+        urls: ([] as string[]).concat(s.urls).filter((u) => !u.includes(":53?")),
+      }));
+      this.iceCache = { servers, expiresAt: Date.now() + (ICE_TTL_SECONDS / 2) * 1000 };
+      return servers;
+    } catch (err) {
+      console.error("Falha ao gerar credenciais TURN", err);
+      return DEFAULT_ICE_SERVERS;
+    }
   }
 
   private broadcastLobby() {

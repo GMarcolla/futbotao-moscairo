@@ -59,9 +59,10 @@ export class Panel {
     el.addEventListener("change", (e) => {
       const select = e.target as HTMLSelectElement;
       if (!select.dataset.setting || !this.state) return;
+      const key = select.dataset.setting;
       actions.changeSettings({
         ...this.state.settings,
-        [select.dataset.setting]: Number(select.value),
+        [key]: key === "network" ? select.value : Number(select.value),
       });
     });
   }
@@ -107,7 +108,9 @@ export class Panel {
     if (state.phase === "countdown") {
       status = `<div class="status countdown">Começando em <b data-countdown>3</b>…</div>`;
     } else if (inMatch) {
-      status = `<div class="status">Partida em andamento — escolha um time para entrar no jogo.</div>`;
+      const host = state.players.find((p) => p.id === state.matchHostId);
+      const where = host ? ` Hospedada no navegador de <b>${escapeHtml(host.name)}</b>.` : "";
+      status = `<div class="status">Partida em andamento — escolha um time para entrar no jogo.${where}</div>`;
     } else if (state.lastResult) {
       const { score, winner } = state.lastResult;
       const text = winner ? `${TEAMS[winner].name} venceu!` : "Empate!";
@@ -131,6 +134,11 @@ export class Panel {
         ${values.map((v) => `<option value="${v}" ${v === s[key] ? "selected" : ""}>${fmt(v)}</option>`).join("")}
       </select>`;
     const lim = SETTINGS_LIMITS;
+    const networkSelect = `
+      <select data-setting="network" ${isHost && !inMatch ? "" : "disabled"}>
+        <option value="p2p" ${s.network === "p2p" ? "selected" : ""}>P2P (recomendado)</option>
+        <option value="server" ${s.network === "server" ? "selected" : ""}>Servidor (reserva)</option>
+      </select>`;
 
     this.el.innerHTML = `
       <div class="card wide">
@@ -146,6 +154,7 @@ export class Panel {
         <div class="settings">
           <label>Tempo ${select("timeLimitMin", range(lim.timeLimitMin.min, lim.timeLimitMin.max), (v) => `${v} min`)}</label>
           <label>Gols para vencer ${select("scoreLimit", range(lim.scoreLimit.min, lim.scoreLimit.max), (v) => (v === 0 ? "sem limite" : String(v)))}</label>
+          <label title="P2P: a partida roda no navegador de quem criou a sala (menos atraso). Servidor: roda na Cloudflare, para redes que bloqueiam P2P.">Rede ${networkSelect}</label>
           <label>Recarga do dash ${select("dashCooldownSec", range(lim.dashCooldownSec.min, lim.dashCooldownSec.max), (v) => `${v}s`)}</label>
           <span class="muted small">${isHost ? "Você criou a sala e pode ajustar as regras." : "Só quem criou a sala ajusta as regras."}</span>
         </div>
